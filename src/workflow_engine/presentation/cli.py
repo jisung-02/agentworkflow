@@ -9,10 +9,12 @@ from pathlib import Path
 
 from workflow_engine.application.dto import StartRunCommand
 from workflow_engine.application.engine import WorkflowEngine
+from workflow_engine.application.notifications import NotificationService
+from workflow_engine.application.timer import TimerService
 from workflow_engine.bootstrap.container import (
+    build_channel_access_store,
     build_engine,
     build_notification_service,
-    build_notification_store,
     build_timer_service,
 )
 from workflow_engine.domain.model import Definition
@@ -107,6 +109,25 @@ def _print_status(engine: WorkflowEngine, run_id: RunId) -> None:
     )
 
 
+def _run_cycle(
+    engine: WorkflowEngine, timer: TimerService, notifications: NotificationService
+) -> None:
+    timer.fire_due()
+    now = engine.clock.now_epoch()
+    engine.store.wake_due(now)
+    engine.store.recover_expired_inflight(now)
+    for run_id in engine.store.ready_run_ids():
+        try:
+            engine.run_until_idle(run_id)
+            _print_status(engine, run_id)
+        except Exception as exc:
+            print(f"workflow: run {run_id.value} failed: {exc}", file=sys.stderr)
+    try:
+        notifications.deliver_pending()
+    except Exception as exc:
+        print(f"workflow: notification delivery failed: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -145,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
                 engine,
                 FilesystemDefinitionCatalog(args.definitions),
                 AllowListPolicy(actors),
-                build_notification_store(args.db),
+                build_channel_access_store(args.db),
             )
             app = create_app(controller, slack_secret, discord_key)
             uvicorn.run(app, host=args.host, port=args.port)
@@ -221,12 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                 os.getenv("WORKFLOW_DISCORD_BOT_TOKEN"),
             )
             while True:
-                timer.fire_due()
-                engine.store.wake_due(engine.clock.now_epoch())
-                for run_id in engine.store.ready_run_ids():
-                    engine.run_until_idle(run_id)
-                    _print_status(engine, run_id)
-                notifications.deliver_pending()
+                _run_cycle(engine, timer, notifications)
                 if args.command == "tick":
                     return 0
                 time.sleep(args.interval)

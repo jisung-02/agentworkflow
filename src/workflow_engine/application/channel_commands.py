@@ -4,7 +4,7 @@ import shlex
 
 from workflow_engine.application.dto import ChannelCommandDTO, ChannelResponseDTO, StartRunCommand
 from workflow_engine.application.engine import WorkflowEngine
-from workflow_engine.application.ports import ActorPolicy, DefinitionCatalog, NotificationStore
+from workflow_engine.application.ports import ActorPolicy, ChannelAccessStore, DefinitionCatalog
 from workflow_engine.domain.value_objects import RunId, TokenId
 
 
@@ -14,12 +14,12 @@ class ChannelController:
         engine: WorkflowEngine,
         catalog: DefinitionCatalog,
         policy: ActorPolicy,
-        notifications: NotificationStore,
+        access: ChannelAccessStore,
     ) -> None:
         self.engine = engine
         self.catalog = catalog
         self.policy = policy
-        self.notifications = notifications
+        self.access = access
 
     def handle(self, command: ChannelCommandDTO) -> ChannelResponseDTO:
         if not self.policy.permits(command):
@@ -47,11 +47,14 @@ class ChannelController:
                         f"{command.source}:{command.message_id}",
                     ),
                 )
-                if command.channel_id is not None:
-                    self.notifications.bind_channel(run_id, command.source, command.channel_id)
+                self.access.bind_channel(
+                    run_id, command.source, command.actor_id, command.channel_id
+                )
                 return ChannelResponseDTO(f"실행 등록: {run_id.value}")
             if action == "status" and len(parts) == 2:
                 run_id = RunId(parts[1])
+                if not self.access.can_access(run_id, command.source, command.actor_id):
+                    return ChannelResponseDTO("이 실행을 조회할 권한이 없습니다.")
                 status = self.engine.status(run_id)
                 waiting = self.engine.store.waiting_tokens(run_id)
                 definition = self.engine.store.definition_for_run(run_id)
@@ -70,6 +73,9 @@ class ChannelController:
                 )
             if action == "respond" and len(parts) == 3:
                 token_id = TokenId(parts[1])
+                token = self.engine.store.token(token_id)
+                if not self.access.can_access(token.run_id, command.source, command.actor_id):
+                    return ChannelResponseDTO("이 실행에 응답할 권한이 없습니다.")
                 applied = self.engine.submit_input(token_id, parts[2])
                 return ChannelResponseDTO(
                     "응답이 저장되었습니다." if applied else "이미 처리된 응답입니다."

@@ -34,7 +34,7 @@ def _controller(tmp_path: Path) -> ChannelController:
     return ChannelController(
         engine,
         FilesystemDefinitionCatalog(folder),
-        AllowListPolicy(frozenset({"slack:U1", "discord:D1"})),
+        AllowListPolicy(frozenset({"slack:U1", "slack:U2", "discord:D1"})),
         notifications,
     )
 
@@ -42,7 +42,7 @@ def _controller(tmp_path: Path) -> ChannelController:
 def test_channel_command_is_authorized_and_idempotent(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     denied = controller.handle(
-        ChannelCommandDTO("slack", "U2", "one", "run example-workflow request=x")
+        ChannelCommandDTO("slack", "U3", "one", "run example-workflow request=x")
     )
     assert "권한" in denied.text
     command = ChannelCommandDTO("slack", "U1", "one", "run example-workflow request=x")
@@ -104,7 +104,7 @@ def test_completed_run_creates_one_durable_notification(tmp_path: Path) -> None:
     run_id = response.text.split()[-1]
     controller.engine.run_until_idle(RunId(run_id))
     sender = FakeSender()
-    notifier = NotificationService(controller.notifications, {"slack": sender})
+    notifier = NotificationService(SQLiteStore(tmp_path / "state.db"), {"slack": sender})
     assert notifier.deliver_pending() == 1
     assert notifier.deliver_pending() == 0
     assert sender.messages[0].channel_id == "C1"
@@ -112,6 +112,42 @@ def test_completed_run_creates_one_durable_notification(tmp_path: Path) -> None:
     status = controller.handle(ChannelCommandDTO("slack", "U1", "status-1", f"status {run_id}"))
     assert "결과 요약:" in status.text
     assert "plan:" in status.text
+
+
+def test_only_initiating_actor_can_inspect_or_respond(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    source = tmp_path / "definitions" / "approval.yaml"
+    source.write_text(
+        """version: 1
+id: approval
+entry: ask
+states:
+  ask:
+    kind: wait
+    prompt: Approve?
+    outcomes: [yes]
+    on: {yes: done}
+  done: {kind: end, result: success}
+""",
+        encoding="utf-8",
+    )
+    response = controller.handle(ChannelCommandDTO("slack", "U1", "start", "run approval", "C1"))
+    run_id = RunId(response.text.split()[-1])
+    controller.engine.run_until_idle(run_id)
+    token_id = controller.engine.store.waiting_tokens(run_id)[0].id.value
+    other_status = controller.handle(
+        ChannelCommandDTO("slack", "U2", "read", f"status {run_id.value}")
+    )
+    other_answer = controller.handle(
+        ChannelCommandDTO("slack", "U2", "answer", f"respond {token_id} yes")
+    )
+    assert "권한" in other_status.text
+    assert "권한" in other_answer.text
+    assert controller.engine.status(run_id).status == "waiting_input"
+    owner_answer = controller.handle(
+        ChannelCommandDTO("slack", "U1", "answer", f"respond {token_id} yes")
+    )
+    assert "저장" in owner_answer.text
 
 
 def test_binding_after_wait_delivers_pending_prompt(tmp_path: Path) -> None:
@@ -135,7 +171,7 @@ states:
     run_id = engine.start(definition, StartRunCommand(definition.id, ()))
     assert engine.run_until_idle(run_id).status == "waiting_input"
     store = SQLiteStore(tmp_path / "state.db")
-    store.bind_channel(run_id, "discord", "C2")
+    store.bind_channel(run_id, "discord", "D1", "C2")
     sender = FakeSender()
     assert NotificationService(store, {"discord": sender}).deliver_pending() == 1
     assert "승인할까요?" in sender.messages[0].text

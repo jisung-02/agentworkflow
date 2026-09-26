@@ -80,6 +80,10 @@ class SQLiteStore:
                     run_id TEXT NOT NULL REFERENCES runs(id), source TEXT NOT NULL,
                     channel_id TEXT NOT NULL, PRIMARY KEY (run_id, source, channel_id)
                 );
+                CREATE TABLE IF NOT EXISTS run_actors (
+                    run_id TEXT NOT NULL REFERENCES runs(id), source TEXT NOT NULL,
+                    actor_id TEXT NOT NULL, PRIMARY KEY (run_id, source)
+                );
                 CREATE TABLE IF NOT EXISTS notifications (
                     id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
                     source TEXT NOT NULL, channel_id TEXT NOT NULL,
@@ -628,24 +632,56 @@ class SQLiteStore:
 
     def mark_attention(self, token: TokenDTO) -> None:
         with self._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE tokens SET status='needs_attention', lease_until=NULL, version=version+1 "
+                "WHERE id=? AND status NOT IN ('done', 'joined', 'needs_attention') AND version=?",
+                (token.id.value, token.version),
+            ).rowcount
+            if changed:
+                self._event(
+                    conn, token.run_id.value, token.id.value, "needs_attention", token.state_id
+                )
+                self._queue_notification(
+                    conn,
+                    token.run_id.value,
+                    f"실행 점검 필요: {token.run_id.value} (상태: {token.state_id})",
+                    f"attention:{token.id.value}:{token.version + 1}",
+                )
+
+    def _recover_expired(
+        self, conn: sqlite3.Connection, now: float, run_id: RunId | None = None
+    ) -> int:
+        query = (
+            "SELECT id, run_id, state_id, version FROM tokens WHERE status='executing' "
+            "AND (lease_until IS NULL OR lease_until <= ?)"
+        )
+        parameters: tuple[float] | tuple[float, str] = (now,)
+        if run_id is not None:
+            query += " AND run_id=?"
+            parameters = (now, run_id.value)
+        rows = conn.execute(query, parameters).fetchall()
+        for row in rows:
             conn.execute(
                 "UPDATE tokens SET status='needs_attention', lease_until=NULL, version=version+1 "
-                "WHERE id=? AND version=?",
-                (token.id.value, token.version),
+                "WHERE id=?",
+                (row["id"],),
             )
-            self._event(conn, token.run_id.value, token.id.value, "needs_attention", token.state_id)
+            self._event(conn, str(row["run_id"]), str(row["id"]), "recovered_inflight", str(now))
+            self._queue_notification(
+                conn,
+                str(row["run_id"]),
+                f"실행 점검 필요: {row['run_id']} (중단된 상태: {row['state_id']})",
+                f"attention:{row['id']}:{int(row['version']) + 1}",
+            )
+        return len(rows)
 
     def recover_inflight(self, run_id: RunId) -> int:
         with self._transaction() as conn:
-            changed = conn.execute(
-                "UPDATE tokens SET status='needs_attention', lease_until=NULL, version=version+1 "
-                "WHERE run_id=? AND status='executing' "
-                "AND (lease_until IS NULL OR lease_until <= ?)",
-                (run_id.value, time.time()),
-            ).rowcount
-            if changed:
-                self._event(conn, run_id.value, None, "recovered_inflight", str(changed))
-            return int(changed)
+            return self._recover_expired(conn, time.time(), run_id)
+
+    def recover_expired_inflight(self, now: float) -> int:
+        with self._transaction() as conn:
+            return self._recover_expired(conn, now)
 
     def renew_lease(self, token_id: TokenId) -> bool:
         with self._transaction() as conn:
@@ -656,13 +692,10 @@ class SQLiteStore:
                 ).rowcount
             )
 
-    def bind_channel(self, run_id: RunId, source: str, channel_id: str) -> None:
+    def bind_channel(
+        self, run_id: RunId, source: str, actor_id: str, channel_id: str | None
+    ) -> None:
         with self._transaction() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO channel_bindings(run_id, source, channel_id) "
-                "VALUES (?, ?, ?)",
-                (run_id.value, source, channel_id),
-            )
             row = conn.execute(
                 "SELECT r.status, d.payload FROM runs r JOIN definitions d "
                 "ON r.definition_hash=d.hash WHERE r.id=?",
@@ -670,6 +703,23 @@ class SQLiteStore:
             ).fetchone()
             if row is None:
                 raise ValueError("unknown run")
+            owner = conn.execute(
+                "SELECT actor_id FROM run_actors WHERE run_id=? AND source=?",
+                (run_id.value, source),
+            ).fetchone()
+            if owner is not None and owner["actor_id"] != actor_id:
+                raise ValueError("run is bound to another actor")
+            conn.execute(
+                "INSERT OR IGNORE INTO run_actors(run_id, source, actor_id) VALUES (?, ?, ?)",
+                (run_id.value, source, actor_id),
+            )
+            if channel_id is None:
+                return
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_bindings(run_id, source, channel_id) "
+                "VALUES (?, ?, ?)",
+                (run_id.value, source, channel_id),
+            )
             if row["status"] in ("success", "failure"):
                 self._queue_notification(
                     conn,
@@ -692,6 +742,14 @@ class SQLiteStore:
                         f"응답 필요: {prompt}\n토큰: {token['id']}",
                         f"wait:{token['id']}:{token['version']}",
                     )
+
+    def can_access(self, run_id: RunId, source: str, actor_id: str) -> bool:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM run_actors WHERE run_id=? AND source=? AND actor_id=?",
+                (run_id.value, source, actor_id),
+            ).fetchone()
+        return row is not None
 
     def pending_notifications(self) -> tuple[NotificationDTO, ...]:
         with closing(self._connect()) as conn:

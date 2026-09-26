@@ -13,7 +13,7 @@ uv run workflow run examples/example-workflow.yaml --input request="새 기능 �
 
 `workflow run`은 JSON으로 실행 ID와 결과를 출력합니다. 기본 DB는 현재 디렉터리의 `.workflow/state.db`이며 `--db`로 바꿀 수 있습니다. `status RUN_ID`, `resume RUN_ID`로 조회·재개합니다. 사람의 응답을 기다리는 State는 `status`의 `waiting_tokens`에 토큰 ID가 표시되며 `respond TOKEN_ID OUTCOME`으로 제출합니다. Task 결과는 DB의 `outputs`와 DB 옆 `artifacts/`의 파일에 저장되며, `status`의 `artifacts`에서 경로와 SHA-256을 확인할 수 있습니다.
 
-타이머가 있는 YAML은 `workflow register FILE`로 등록합니다. `workflow tick`은 기한이 된 스케줄을 한 번 실행하고, `workflow serve --interval 30`은 계속 폴링합니다. 해당 프로세스가 실행 중이어야 예약과 사용량 제한 후 재개가 진행됩니다.
+타이머가 있는 YAML은 `workflow register FILE`로 등록합니다. `workflow tick`은 기한이 된 스케줄을 한 번 실행하고, `workflow serve --interval 30`은 계속 폴링합니다. 해당 프로세스가 실행 중이어야 예약과 사용량 제한 후 재개가 진행됩니다. 워커는 만료된 실행 lease를 `needs_attention`으로 회수하고, 개별 실행 오류가 나도 다른 준비된 실행을 계속 처리합니다.
 
 `echo` runner는 설치 확인과 테스트용입니다. `codex` runner는 로컬 Codex CLI 로그인 상태를 이용해 `codex exec`를 호출합니다. `codex-review`는 같은 CLI를 읽기 전용 sandbox에서 실행하는 검토용 runner입니다. 처음 사용하기 전에 `codex login`을 완료해야 합니다. 병렬 Codex branch는 원본 Git 저장소의 `HEAD`에서 각각 별도 worktree를 만들며, 원본의 미커밋 변경은 복사되지 않습니다. branch 결과에는 worktree 경로가 포함됩니다. join 뒤 변경 병합은 YAML에서 명시한 후속 작업이 수행해야 합니다.
 
@@ -31,7 +31,7 @@ export WORKFLOW_DISCORD_PUBLIC_KEY='...'
 uv run --all-extras workflow serve-http --definitions ./definitions
 ```
 
-`definitions/ID.yaml`에 정의 파일을 두고 그 안의 `id`를 `ID`와 맞춥니다. Slack slash command의 Request URL은 `/slack/command`, Discord interaction endpoint는 `/discord/interactions`입니다. Discord 애플리케이션 명령에는 `text` 문자열 옵션을 추가합니다. 두 채널 모두 `run ID request=...`, `status RUN_ID`, `respond TOKEN_ID OUTCOME`을 받습니다. 서명 검증과 허용 사용자 목록을 모두 통과해야 합니다. 작업은 HTTP 요청에서 시작만 하고 별도의 `workflow serve` 프로세스가 실행합니다.
+`definitions/ID.yaml`에 정의 파일을 두고 그 안의 `id`를 `ID`와 맞춥니다. Slack slash command의 Request URL은 `/slack/command`, Discord interaction endpoint는 `/discord/interactions`입니다. Discord 애플리케이션 명령에는 `text` 문자열 옵션을 추가합니다. 두 채널 모두 `run ID request=...`, `status RUN_ID`, `respond TOKEN_ID OUTCOME`을 받습니다. 서명 검증과 허용 사용자 목록을 통과해야 하며, `status`와 `respond`는 해당 채널에서 실행을 시작한 계정만 사용할 수 있습니다. 기존 DB의 실행 중 소유자 정보가 없는 것은 채널에서 조회할 수 없으므로 CLI로 확인하거나 새 실행을 시작하세요. 작업은 HTTP 요청에서 시작만 하고 별도의 `workflow serve` 프로세스가 실행합니다.
 
 사람의 응답 대기 프롬프트와 실행 완료 알림은 SQLite outbox에 저장됩니다. `workflow serve`에 `WORKFLOW_SLACK_BOT_TOKEN` 또는 `WORKFLOW_DISCORD_BOT_TOKEN`을 설정하면 원래 명령을 보낸 채널로 메시지를 전송합니다. 토큰이 없거나 전송에 실패하면 알림은 대기 상태로 남아 다음 폴링에서 재시도합니다. 외부 전송 직후 프로세스가 중단되면 같은 알림이 중복 전달될 수 있습니다. 봇에는 대상 채널에 메시지를 보낼 권한이 필요합니다.
 

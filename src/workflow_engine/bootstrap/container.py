@@ -2,7 +2,7 @@ from pathlib import Path
 
 from workflow_engine.application.engine import WorkflowEngine
 from workflow_engine.application.notifications import NotificationService
-from workflow_engine.application.ports import NotificationSender, NotificationStore, Runner
+from workflow_engine.application.ports import ChannelAccessStore, NotificationSender, Runner
 from workflow_engine.application.timer import TimerService
 from workflow_engine.infrastructure.channel_sender import DiscordBotSender, SlackBotSender
 from workflow_engine.infrastructure.clock import SystemClock
@@ -49,5 +49,5 @@ def build_notification_service(
     return NotificationService(SQLiteStore(database), senders)
 
 
-def build_notification_store(database: Path) -> NotificationStore:
+def build_channel_access_store(database: Path) -> ChannelAccessStore:
     return SQLiteStore(database)
