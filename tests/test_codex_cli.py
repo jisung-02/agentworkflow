@@ -64,6 +64,12 @@ def test_codex_cli_parses_structured_result(tmp_path: Path) -> None:
     assert "--output-schema" in fake.command
 
 
+def test_codex_review_runner_uses_read_only_sandbox(tmp_path: Path) -> None:
+    fake = FakeProcess()
+    CodexCliRunner(process=fake, sandbox_mode="read-only").run(_request(tmp_path))
+    assert fake.command[fake.command.index("--sandbox") + 1] == "read-only"
+
+
 def test_codex_cli_converts_usage_limit_to_wait(tmp_path: Path) -> None:
     fake = FakeProcess(returncode=1, stderr="Usage limit reached; resets at 2026-10-01T09:00:00Z")
     with pytest.raises(QuotaExceeded) as error:

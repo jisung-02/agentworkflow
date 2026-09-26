@@ -15,7 +15,11 @@ from workflow_engine.infrastructure.unsafe_boundary import load_runner_plugins
 
 
 def build_engine(database: Path, workdir: Path) -> WorkflowEngine:
-    runners: dict[str, Runner] = {"echo": EchoRunner(), "codex": CodexCliRunner()}
+    runners: dict[str, Runner] = {
+        "echo": EchoRunner(),
+        "codex": CodexCliRunner(),
+        "codex-review": CodexCliRunner(sandbox_mode="read-only"),
+    }
     for name, runner in load_runner_plugins().items():
         if name in runners or name in ("claude-host", "codex-host"):
             raise ValueError(f"runner name is reserved: {name}")

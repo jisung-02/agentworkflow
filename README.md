@@ -15,7 +15,7 @@ uv run workflow run examples/example-workflow.yaml --input request="새 기능 �
 
 타이머가 있는 YAML은 `workflow register FILE`로 등록합니다. `workflow tick`은 기한이 된 스케줄을 한 번 실행하고, `workflow serve --interval 30`은 계속 폴링합니다. 해당 프로세스가 실행 중이어야 예약과 사용량 제한 후 재개가 진행됩니다.
 
-`echo` runner는 설치 확인과 테스트용입니다. `codex` runner는 로컬 Codex CLI 로그인 상태를 이용해 `codex exec`를 호출합니다. 처음 사용하기 전에 `codex login`을 완료해야 합니다. 병렬 Codex branch는 원본 Git 저장소의 `HEAD`에서 각각 별도 worktree를 만들며, 원본의 미커밋 변경은 복사되지 않습니다. branch 결과에는 worktree 경로가 포함됩니다. join 뒤 변경 병합은 YAML에서 명시한 후속 작업이 수행해야 합니다.
+`echo` runner는 설치 확인과 테스트용입니다. `codex` runner는 로컬 Codex CLI 로그인 상태를 이용해 `codex exec`를 호출합니다. `codex-review`는 같은 CLI를 읽기 전용 sandbox에서 실행하는 검토용 runner입니다. 처음 사용하기 전에 `codex login`을 완료해야 합니다. 병렬 Codex branch는 원본 Git 저장소의 `HEAD`에서 각각 별도 worktree를 만들며, 원본의 미커밋 변경은 복사되지 않습니다. branch 결과에는 worktree 경로가 포함됩니다. join 뒤 변경 병합은 YAML에서 명시한 후속 작업이 수행해야 합니다.
 
 Codex 사용량 제한이 발생하면 재설정 시각과 세션 ID를 저장하고 `workflow serve`가 재설정 후 같은 세션을 재개합니다. CLI가 세션 ID를 반환하지 않아 안전하게 재개할 수 없는 경우 Run은 `needs_attention`으로 남습니다. 실제 모델 호출은 자동 테스트에 포함되지 않습니다.
 
@@ -51,7 +51,7 @@ GitHub에서 CLI를 설치하려면 `uv tool install git+https://github.com/jisu
 
 ## 사용자 정의 runner
 
-별도 Python 패키지의 entry point 그룹 `workflow_engine.runners`에 `이름 = "패키지:팩토리"`를 등록합니다. 팩토리는 인자 없이 호출되며 `run(TaskRequestDTO) -> TaskResultDTO`를 구현한 객체를 반환해야 합니다. YAML의 `runner`에 해당 이름을 적습니다. 설치된 runner는 Composition Root에서 찾아 `Runner` 인터페이스에 주입하며, `echo`, `codex`, `claude-host`, `codex-host`는 예약된 이름입니다. 외부 패키지 로딩 중 생기는 동적 타입은 `unsafe_boundary.py`에서 검증합니다.
+별도 Python 패키지의 entry point 그룹 `workflow_engine.runners`에 `이름 = "패키지:팩토리"`를 등록합니다. 팩토리는 인자 없이 호출되며 `run(TaskRequestDTO) -> TaskResultDTO`를 구현한 객체를 반환해야 합니다. YAML의 `runner`에 해당 이름을 적습니다. 설치된 runner는 Composition Root에서 찾아 `Runner` 인터페이스에 주입하며, `echo`, `codex`, `codex-review`, `claude-host`, `codex-host`는 예약된 이름입니다. 외부 패키지 로딩 중 생기는 동적 타입은 `unsafe_boundary.py`에서 검증합니다.
 
 개발 환경:
 

@@ -109,6 +109,9 @@ def test_completed_run_creates_one_durable_notification(tmp_path: Path) -> None:
     assert notifier.deliver_pending() == 0
     assert sender.messages[0].channel_id == "C1"
     assert "실행 완료" in sender.messages[0].text
+    status = controller.handle(ChannelCommandDTO("slack", "U1", "status-1", f"status {run_id}"))
+    assert "결과 요약:" in status.text
+    assert "plan:" in status.text
 
 
 def test_binding_after_wait_delivers_pending_prompt(tmp_path: Path) -> None:

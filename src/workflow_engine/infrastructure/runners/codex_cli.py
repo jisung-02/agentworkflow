@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from workflow_engine.application.dto import TaskRequestDTO, TaskResultDTO
 from workflow_engine.application.engine import QuotaExceeded
@@ -15,6 +16,7 @@ from workflow_engine.infrastructure.unsafe_boundary import load_json
 from workflow_engine.infrastructure.yaml_definition import _mapping, _string
 
 ProcessCall = Callable[..., subprocess.CompletedProcess[str]]
+SandboxMode = Literal["read-only", "workspace-write"]
 
 
 def _quota_reset(text: str) -> float | None:
@@ -48,10 +50,12 @@ class CodexCliRunner:
         executable: str = "codex",
         process: ProcessCall = subprocess.run,
         timeout_seconds: int = 3600,
+        sandbox_mode: SandboxMode = "workspace-write",
     ) -> None:
         self.executable = executable
         self.process = process
         self.timeout_seconds = timeout_seconds
+        self.sandbox_mode = sandbox_mode
 
     def run(self, request: TaskRequestDTO) -> TaskResultDTO:
         workdir = Path(request.workdir).resolve()
@@ -85,7 +89,7 @@ class CodexCliRunner:
                     "exec",
                     "--json",
                     "--sandbox",
-                    "workspace-write",
+                    self.sandbox_mode,
                     "--cd",
                     str(workdir),
                     "--output-schema",
