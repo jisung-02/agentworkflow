@@ -83,6 +83,8 @@ class WorkflowEngine:
                     inputs=self.store.inputs_for_run(run_id),
                     outputs=self.store.outputs_for_run(run_id),
                     workdir=str(self.workdir),
+                    branch_id=token.branch_id,
+                    outcomes=state.outcomes,
                 )
                 try:
                     result = runner.run(request)

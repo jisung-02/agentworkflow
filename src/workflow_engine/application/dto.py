@@ -30,6 +30,8 @@ class TaskRequestDTO:
     inputs: tuple[tuple[str, str], ...]
     outputs: tuple[tuple[str, str], ...]
     workdir: str
+    branch_id: str | None = None
+    outcomes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,3 +60,13 @@ class TokenDTO:
     branch_id: str | None
     last_outcome: str | None
     version: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleDTO:
+    id: str
+    definition_hash: str
+    cron: str
+    timezone: str
+    inputs: tuple[tuple[str, str], ...]
+    due_at: float

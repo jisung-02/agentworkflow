@@ -1,6 +1,9 @@
 """Strict YAML parsing and graph validation."""
 
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from croniter import croniter
 
 from workflow_engine.domain.model import Definition, State, TimerTrigger
 from workflow_engine.infrastructure.unsafe_boundary import load_yaml
@@ -139,10 +142,18 @@ def _timers(value: object) -> tuple[TimerTrigger, ...]:
             _allowed(data, {"type"}, f"triggers[{index}]")
         elif trigger_type == "timer":
             _allowed(data, {"type", "cron", "timezone", "input"}, f"triggers[{index}]")
+            expression = _string(data.get("cron"), f"triggers[{index}].cron")
+            timezone = _string(data.get("timezone"), f"triggers[{index}].timezone")
+            if not croniter.is_valid(expression):
+                raise DefinitionError(f"triggers[{index}].cron is invalid")
+            try:
+                ZoneInfo(timezone)
+            except ZoneInfoNotFoundError as exc:
+                raise DefinitionError(f"triggers[{index}].timezone is invalid") from exc
             result.append(
                 TimerTrigger(
-                    cron=_string(data.get("cron"), f"triggers[{index}].cron"),
-                    timezone=_string(data.get("timezone"), f"triggers[{index}].timezone"),
+                    cron=expression,
+                    timezone=timezone,
                     inputs=_pairs(data.get("input", {}), f"triggers[{index}].input"),
                 )
             )
@@ -175,6 +186,9 @@ def parse_definition(path: Path) -> Definition:
         states=tuple(_state(name, raw, path.parent) for name, raw in states_data.items()),
         timers=_timers(data.get("triggers")),
     )
+    for timer in definition.timers:
+        if set(dict(timer.inputs)) != set(definition.inputs):
+            raise DefinitionError("timer inputs must match declared inputs")
     validate_graph(definition)
     return definition
 

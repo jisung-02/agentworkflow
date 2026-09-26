@@ -1,7 +1,13 @@
 from typing import Protocol
 
-from workflow_engine.application.dto import RunStatusDTO, TaskRequestDTO, TaskResultDTO, TokenDTO
-from workflow_engine.domain.model import Definition
+from workflow_engine.application.dto import (
+    RunStatusDTO,
+    ScheduleDTO,
+    TaskRequestDTO,
+    TaskResultDTO,
+    TokenDTO,
+)
+from workflow_engine.domain.model import Definition, TimerTrigger
 from workflow_engine.domain.value_objects import RunId, TokenId
 
 
@@ -11,6 +17,18 @@ class Runner(Protocol):
 
 class Clock(Protocol):
     def now_epoch(self) -> float: ...
+
+
+class NextFire(Protocol):
+    def after(self, cron: str, timezone: str, epoch: float) -> float: ...
+
+
+class ScheduleStore(Protocol):
+    def register_timer(
+        self, definition_hash: str, index: int, timer: TimerTrigger, due_at: float
+    ) -> None: ...
+    def due_schedules(self, now: float) -> tuple[ScheduleDTO, ...]: ...
+    def fire_schedule(self, schedule: ScheduleDTO, next_at: float) -> RunId | None: ...
 
 
 class WorkflowStore(Protocol):
@@ -23,6 +41,7 @@ class WorkflowStore(Protocol):
     def outputs_for_run(self, run_id: RunId) -> tuple[tuple[str, str], ...]: ...
     def status(self, run_id: RunId) -> RunStatusDTO: ...
     def next_ready(self, run_id: RunId) -> TokenDTO | None: ...
+    def ready_run_ids(self) -> tuple[RunId, ...]: ...
     def waiting_tokens(self, run_id: RunId) -> tuple[TokenDTO, ...]: ...
     def token(self, token_id: TokenId) -> TokenDTO: ...
     def claim(self, token: TokenDTO) -> TokenDTO | None: ...

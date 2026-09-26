@@ -9,9 +9,9 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-from workflow_engine.application.dto import RunStatus, RunStatusDTO, TokenDTO
+from workflow_engine.application.dto import RunStatus, RunStatusDTO, ScheduleDTO, TokenDTO
 from workflow_engine.domain.errors import VisitLimitError
-from workflow_engine.domain.model import Definition
+from workflow_engine.domain.model import Definition, TimerTrigger
 from workflow_engine.domain.value_objects import RunId, TokenId
 from workflow_engine.infrastructure.serialization import definition_from_json, definition_json
 from workflow_engine.infrastructure.unsafe_boundary import load_json
@@ -62,8 +62,14 @@ class SQLiteStore:
                     token_id TEXT, kind TEXT NOT NULL, detail TEXT NOT NULL,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id TEXT PRIMARY KEY, definition_hash TEXT NOT NULL REFERENCES definitions(hash),
+                    cron TEXT NOT NULL, timezone TEXT NOT NULL, inputs TEXT NOT NULL,
+                    next_at REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS tokens_ready ON tokens(run_id, status);
                 CREATE INDEX IF NOT EXISTS tokens_wake ON tokens(status, wake_at);
+                CREATE INDEX IF NOT EXISTS schedules_due ON schedules(next_at);
                 """
             )
 
@@ -246,6 +252,13 @@ class SQLiteStore:
                 (run_id.value,),
             ).fetchone()
         return self._token(row) if row is not None else None
+
+    def ready_run_ids(self) -> tuple[RunId, ...]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT run_id FROM tokens WHERE status='ready' ORDER BY run_id"
+            ).fetchall()
+        return tuple(RunId(str(row["run_id"])) for row in rows)
 
     def waiting_tokens(self, run_id: RunId) -> tuple[TokenDTO, ...]:
         with closing(self._connect()) as conn:
@@ -488,3 +501,76 @@ class SQLiteStore:
             if changed:
                 self._event(conn, run_id.value, None, "recovered_inflight", str(changed))
             return int(changed)
+
+    def register_timer(
+        self, definition_hash: str, index: int, timer: TimerTrigger, due_at: float
+    ) -> None:
+        schedule_id = f"{definition_hash}:{index}"
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO schedules(id, definition_hash, cron, timezone, "
+                "inputs, next_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    schedule_id,
+                    definition_hash,
+                    timer.cron,
+                    timer.timezone,
+                    json.dumps(dict(timer.inputs)),
+                    due_at,
+                ),
+            )
+
+    def due_schedules(self, now: float) -> tuple[ScheduleDTO, ...]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM schedules WHERE next_at <= ? ORDER BY next_at", (now,)
+            ).fetchall()
+        return tuple(
+            ScheduleDTO(
+                id=str(row["id"]),
+                definition_hash=str(row["definition_hash"]),
+                cron=str(row["cron"]),
+                timezone=str(row["timezone"]),
+                inputs=self._pairs(str(row["inputs"])),
+                due_at=float(row["next_at"]),
+            )
+            for row in rows
+        )
+
+    def fire_schedule(self, schedule: ScheduleDTO, next_at: float) -> RunId | None:
+        with self._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE schedules SET next_at=? WHERE id=? AND next_at=?",
+                (next_at, schedule.id, schedule.due_at),
+            ).rowcount
+            if not changed:
+                return None
+            row = conn.execute(
+                "SELECT payload FROM definitions WHERE hash=?", (schedule.definition_hash,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("schedule definition is missing")
+            definition = definition_from_json(str(row["payload"]))
+            run_id = RunId(uuid.uuid4().hex)
+            token_id = TokenId(uuid.uuid4().hex)
+            conn.execute(
+                "INSERT INTO runs(id, definition_hash, status, inputs, outputs, idempotency_key, "
+                "created_at) VALUES (?, ?, 'running', ?, '{}', ?, ?)",
+                (
+                    run_id.value,
+                    schedule.definition_hash,
+                    json.dumps(dict(schedule.inputs)),
+                    f"timer:{schedule.id}:{schedule.due_at}",
+                    time.time(),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO tokens(id, run_id, state_id, status) VALUES (?, ?, ?, 'ready')",
+                (token_id.value, run_id.value, definition.entry),
+            )
+            self._visit(
+                conn, run_id.value, definition.entry, definition.state(definition.entry).max_visits
+            )
+            self._event(conn, run_id.value, token_id.value, "timer_fired", schedule.id)
+            return run_id
