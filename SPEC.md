@@ -194,6 +194,8 @@ examples/
 
 Port는 Python `Protocol`로 선언하고 생성자에서 주입한다. 전역 서비스 로케이터와 모듈 수준 싱글턴은 사용하지 않는다. 플러그인은 등록 시 계약에 맞는 팩토리를 제공하고 Composition Root에서 연결한다. 테스트는 In-memory Port 구현으로 Use Case를 검증한다.
 
+Port의 소유자는 해당 기능을 사용하는 계층이다. 예를 들어 Application Use Case가 필요한 `WorkflowStore`, `Runner`, `Clock` 계약을 `application/ports.py`에 정의하고, SQLite·Codex·타이머 구현체가 여기에 맞춘다. Application이 구현체 모듈을 import하거나 구현체 전용 예외에 의존하지 않는다.
+
 ### DTO와 VO 규칙
 
 - VO는 `frozen dataclass` 또는 검증된 불변 타입으로 만든다. 예: `RunId`, `StateId`, `Outcome`, `WakeAt`, `DefinitionHash`. 값의 불변식은 생성 시 검사한다.

@@ -46,3 +46,15 @@ class RunStatusDTO:
     status: RunStatus
     active_states: tuple[str, ...]
     outputs: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TokenDTO:
+    id: TokenId
+    run_id: RunId
+    state_id: str
+    status: str
+    fork_id: str | None
+    branch_id: str | None
+    last_outcome: str | None
+    version: int
