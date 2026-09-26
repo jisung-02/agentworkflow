@@ -17,3 +17,9 @@ class TokenId:
     def __post_init__(self) -> None:
         if not self.value:
             raise ValueError("token id must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRef:
+    digest: str
+    path: str

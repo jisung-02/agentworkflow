@@ -1,7 +1,10 @@
+import sqlite3
 from pathlib import Path
 
 from workflow_engine.application.dto import StartRunCommand, TaskRequestDTO, TaskResultDTO
 from workflow_engine.application.engine import QuotaExceeded, WorkflowEngine
+from workflow_engine.infrastructure.clock import SystemClock
+from workflow_engine.infrastructure.file_artifacts import FileArtifactStore
 from workflow_engine.infrastructure.sqlite_store import SQLiteStore
 from workflow_engine.infrastructure.yaml_definition import parse_definition
 
@@ -27,7 +30,13 @@ class QuotaOnceRunner:
 
 
 def _engine(tmp_path: Path, runner: EchoRunner | QuotaOnceRunner) -> WorkflowEngine:
-    return WorkflowEngine(SQLiteStore(tmp_path / "run.db"), {"echo": runner}, tmp_path)
+    return WorkflowEngine(
+        SQLiteStore(tmp_path / "run.db"),
+        {"echo": runner},
+        tmp_path,
+        SystemClock(),
+        FileArtifactStore(tmp_path / "artifacts"),
+    )
 
 
 def test_parallel_run_survives_restart(tmp_path: Path) -> None:
@@ -45,6 +54,13 @@ def test_parallel_run_survives_restart(tmp_path: Path) -> None:
         "implementation": "implement:build",
         "documentation": "document:build",
     }
+    assert {name for name, _ in status.artifacts} == {
+        "plan",
+        "implementation",
+        "documentation",
+    }
+    for name, artifact in status.artifacts:
+        assert Path(artifact.path).read_text(encoding="utf-8") == dict(status.outputs)[name]
     assert restarted.resume(run_id).status == "success"
 
 
@@ -79,6 +95,9 @@ def test_interrupted_external_call_needs_attention(tmp_path: Path) -> None:
     token = engine.store.next_ready(run_id)
     assert token is not None
     assert engine.store.claim(token) is not None
+    assert _engine(tmp_path, EchoRunner()).resume(run_id).status == "running"
+    with sqlite3.connect(tmp_path / "run.db") as conn:
+        conn.execute("UPDATE tokens SET lease_until=0 WHERE id=?", (token.id.value,))
     assert _engine(tmp_path, EchoRunner()).resume(run_id).status == "needs_attention"
 
 

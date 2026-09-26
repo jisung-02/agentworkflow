@@ -9,16 +9,24 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-from workflow_engine.application.dto import RunStatus, RunStatusDTO, ScheduleDTO, TokenDTO
+from workflow_engine.application.dto import (
+    NotificationDTO,
+    RunStatus,
+    RunStatusDTO,
+    ScheduleDTO,
+    TokenDTO,
+)
 from workflow_engine.domain.errors import VisitLimitError
 from workflow_engine.domain.model import Definition, TimerTrigger
-from workflow_engine.domain.value_objects import RunId, TokenId
+from workflow_engine.domain.value_objects import ArtifactRef, RunId, TokenId
 from workflow_engine.infrastructure.serialization import definition_from_json, definition_json
 from workflow_engine.infrastructure.unsafe_boundary import load_json
 from workflow_engine.infrastructure.yaml_definition import _mapping, _string
 
 
 class SQLiteStore:
+    LEASE_SECONDS = 7200
+
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,7 +45,8 @@ class SQLiteStore:
                     id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
                     state_id TEXT NOT NULL, status TEXT NOT NULL, fork_id TEXT,
                     branch_id TEXT, last_outcome TEXT, wake_at REAL,
-                    claimed_at REAL, version INTEGER NOT NULL DEFAULT 0
+                    claimed_at REAL, lease_until REAL, version INTEGER NOT NULL DEFAULT 0,
+                    external_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS forks (
                     id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
@@ -67,11 +76,32 @@ class SQLiteStore:
                     cron TEXT NOT NULL, timezone TEXT NOT NULL, inputs TEXT NOT NULL,
                     next_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS channel_bindings (
+                    run_id TEXT NOT NULL REFERENCES runs(id), source TEXT NOT NULL,
+                    channel_id TEXT NOT NULL, PRIMARY KEY (run_id, source, channel_id)
+                );
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+                    source TEXT NOT NULL, channel_id TEXT NOT NULL,
+                    text TEXT NOT NULL, delivery_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                );
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    run_id TEXT NOT NULL REFERENCES runs(id), output_name TEXT NOT NULL,
+                    digest TEXT NOT NULL, path TEXT NOT NULL,
+                    PRIMARY KEY (run_id, output_name)
+                );
                 CREATE INDEX IF NOT EXISTS tokens_ready ON tokens(run_id, status);
                 CREATE INDEX IF NOT EXISTS tokens_wake ON tokens(status, wake_at);
                 CREATE INDEX IF NOT EXISTS schedules_due ON schedules(next_at);
+                CREATE INDEX IF NOT EXISTS notifications_pending ON notifications(status);
                 """
             )
+            columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(tokens)")}
+            if "external_id" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN external_id TEXT")
+            if "lease_until" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN lease_until REAL")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -103,6 +133,27 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _queue_notification(conn: sqlite3.Connection, run_id: str, message: str, key: str) -> None:
+        bindings = conn.execute(
+            "SELECT source, channel_id FROM channel_bindings WHERE run_id=?", (run_id,)
+        ).fetchall()
+        for binding in bindings:
+            source = str(binding["source"])
+            channel_id = str(binding["channel_id"])
+            conn.execute(
+                "INSERT OR IGNORE INTO notifications(id, run_id, source, channel_id, "
+                "text, delivery_key) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    uuid.uuid4().hex,
+                    run_id,
+                    source,
+                    channel_id,
+                    message,
+                    f"{key}:{source}:{channel_id}",
+                ),
+            )
+
+    @staticmethod
     def _visit(conn: sqlite3.Connection, run_id: str, state_id: str, limit: int | None) -> None:
         row = conn.execute(
             "SELECT count FROM visits WHERE run_id = ? AND state_id = ?", (run_id, state_id)
@@ -127,6 +178,7 @@ class SQLiteStore:
             branch_id=str(row["branch_id"]) if row["branch_id"] is not None else None,
             last_outcome=str(row["last_outcome"]) if row["last_outcome"] is not None else None,
             version=int(row["version"]),
+            external_id=str(row["external_id"]) if row["external_id"] is not None else None,
         )
 
     @staticmethod
@@ -221,6 +273,11 @@ class SQLiteStore:
                 "AND status NOT IN ('done', 'joined')",
                 (run_id.value,),
             ).fetchall()
+            artifacts = conn.execute(
+                "SELECT output_name, digest, path FROM artifacts "
+                "WHERE run_id=? ORDER BY output_name",
+                (run_id.value,),
+            ).fetchall()
         if row is None:
             raise ValueError(f"unknown run {run_id.value}")
         statuses = {str(token["status"]) for token in tokens}
@@ -243,6 +300,10 @@ class SQLiteStore:
             status=status,
             active_states=tuple(str(token["state_id"]) for token in tokens),
             outputs=self._pairs(str(row["outputs"])),
+            artifacts=tuple(
+                (str(item["output_name"]), ArtifactRef(str(item["digest"]), str(item["path"])))
+                for item in artifacts
+            ),
         )
 
     def next_ready(self, run_id: RunId) -> TokenDTO | None:
@@ -278,9 +339,16 @@ class SQLiteStore:
     def claim(self, token: TokenDTO) -> TokenDTO | None:
         with self._transaction() as conn:
             changed = conn.execute(
-                "UPDATE tokens SET status='executing', claimed_at=?, version=version+1 "
+                "UPDATE tokens SET status='executing', claimed_at=?, lease_until=?, "
+                "version=version+1 "
                 "WHERE id=? AND state_id=? AND status='ready' AND version=?",
-                (time.time(), token.id.value, token.state_id, token.version),
+                (
+                    time.time(),
+                    time.time() + self.LEASE_SECONDS,
+                    token.id.value,
+                    token.state_id,
+                    token.version,
+                ),
             ).rowcount
             if not changed:
                 return None
@@ -309,10 +377,13 @@ class SQLiteStore:
         max_visits: int | None,
         output_name: str | None = None,
         output: str = "",
+        artifact: ArtifactRef | None = None,
     ) -> bool:
         with self._transaction() as conn:
             changed = conn.execute(
                 "UPDATE tokens SET state_id=?, status='ready', last_outcome=?, claimed_at=NULL, "
+                "lease_until=NULL, "
+                "external_id=NULL, "
                 "version=version+1 WHERE id=? AND state_id=? AND status=? AND version=?",
                 (target, outcome, token.id.value, token.state_id, token.status, token.version),
             ).rowcount
@@ -336,6 +407,13 @@ class SQLiteStore:
                     "UPDATE runs SET outputs=? WHERE id=?",
                     (json.dumps(outputs, ensure_ascii=False), token.run_id.value),
                 )
+                if artifact is not None:
+                    conn.execute(
+                        "INSERT INTO artifacts(run_id, output_name, digest, path) "
+                        "VALUES (?, ?, ?, ?) ON CONFLICT(run_id, output_name) DO UPDATE SET "
+                        "digest=excluded.digest, path=excluded.path",
+                        (token.run_id.value, output_name, artifact.digest, artifact.path),
+                    )
             self._event(
                 conn, token.run_id.value, token.id.value, "transition", f"{outcome}:{target}"
             )
@@ -427,16 +505,74 @@ class SQLiteStore:
                 )
             return True
 
-    def wait_for_input(self, token: TokenDTO) -> bool:
+    def wait_for_input(self, token: TokenDTO, prompt: str) -> bool:
         with self._transaction() as conn:
-            return bool(
-                conn.execute(
-                    "UPDATE tokens SET status='waiting_input', version=version+1 "
-                    "WHERE id=? AND state_id=? "
-                    "AND status='ready' AND version=?",
-                    (token.id.value, token.state_id, token.version),
-                ).rowcount
+            changed = conn.execute(
+                "UPDATE tokens SET status='waiting_input', version=version+1 "
+                "WHERE id=? AND state_id=? AND status='ready' AND version=?",
+                (token.id.value, token.state_id, token.version),
+            ).rowcount
+            if changed:
+                self._queue_notification(
+                    conn,
+                    token.run_id.value,
+                    f"응답 필요: {prompt}\n토큰: {token.id.value}",
+                    f"wait:{token.id.value}:{token.version + 1}",
+                )
+            return bool(changed)
+
+    def wait_for_host(self, token: TokenDTO) -> bool:
+        with self._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE tokens SET status='waiting_host', version=version+1 WHERE id=? "
+                "AND state_id=? AND status='ready' AND version=?",
+                (token.id.value, token.state_id, token.version),
+            ).rowcount
+            if changed:
+                self._event(
+                    conn, token.run_id.value, token.id.value, "waiting_host", token.state_id
+                )
+            return bool(changed)
+
+    def host_waiting(self) -> tuple[TokenDTO, ...]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM tokens WHERE status='waiting_host' ORDER BY rowid"
+            ).fetchall()
+        return tuple(self._token(row) for row in rows)
+
+    def claim_host(self, token: TokenDTO) -> TokenDTO | None:
+        with self._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE tokens SET status='executing', claimed_at=?, lease_until=?, "
+                "version=version+1 "
+                "WHERE id=? AND state_id=? AND status='waiting_host' AND version=?",
+                (
+                    time.time(),
+                    time.time() + self.LEASE_SECONDS,
+                    token.id.value,
+                    token.state_id,
+                    token.version,
+                ),
+            ).rowcount
+            if not changed:
+                return None
+            number = (
+                int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM attempts WHERE token_id=?", (token.id.value,)
+                    ).fetchone()[0]
+                )
+                + 1
             )
+            conn.execute(
+                "INSERT INTO attempts(token_id, number, status, started_at) "
+                "VALUES (?, ?, 'executing', ?)",
+                (token.id.value, number, time.time()),
+            )
+            self._event(conn, token.run_id.value, token.id.value, "host_claimed", token.state_id)
+            row = conn.execute("SELECT * FROM tokens WHERE id=?", (token.id.value,)).fetchone()
+            return self._token(row)
 
     def submit_input(self, token: TokenDTO, outcome: str, target: str, limit: int | None) -> bool:
         if token.status != "waiting_input":
@@ -454,14 +590,22 @@ class SQLiteStore:
                 return False
             conn.execute("UPDATE runs SET status=? WHERE id=?", (result, token.run_id.value))
             self._event(conn, token.run_id.value, token.id.value, "run_ended", result)
+            self._queue_notification(
+                conn,
+                token.run_id.value,
+                f"실행 완료: {token.run_id.value} ({result})",
+                f"end:{token.run_id.value}",
+            )
             return True
 
-    def quota_wait(self, token: TokenDTO, wake_at: float) -> bool:
+    def quota_wait(self, token: TokenDTO, wake_at: float, external_id: str | None) -> bool:
         with self._transaction() as conn:
             changed = conn.execute(
-                "UPDATE tokens SET status='waiting_quota', wake_at=?, version=version+1 "
+                "UPDATE tokens SET status='waiting_quota', wake_at=?, external_id=?, "
+                "lease_until=NULL, "
+                "version=version+1 "
                 "WHERE id=? AND status='executing' AND version=?",
-                (wake_at, token.id.value, token.version),
+                (wake_at, external_id, token.id.value, token.version),
             ).rowcount
             if changed:
                 conn.execute(
@@ -485,7 +629,7 @@ class SQLiteStore:
     def mark_attention(self, token: TokenDTO) -> None:
         with self._transaction() as conn:
             conn.execute(
-                "UPDATE tokens SET status='needs_attention', version=version+1 "
+                "UPDATE tokens SET status='needs_attention', lease_until=NULL, version=version+1 "
                 "WHERE id=? AND version=?",
                 (token.id.value, token.version),
             )
@@ -494,13 +638,85 @@ class SQLiteStore:
     def recover_inflight(self, run_id: RunId) -> int:
         with self._transaction() as conn:
             changed = conn.execute(
-                "UPDATE tokens SET status='needs_attention', version=version+1 "
-                "WHERE run_id=? AND status='executing'",
-                (run_id.value,),
+                "UPDATE tokens SET status='needs_attention', lease_until=NULL, version=version+1 "
+                "WHERE run_id=? AND status='executing' "
+                "AND (lease_until IS NULL OR lease_until <= ?)",
+                (run_id.value, time.time()),
             ).rowcount
             if changed:
                 self._event(conn, run_id.value, None, "recovered_inflight", str(changed))
             return int(changed)
+
+    def renew_lease(self, token_id: TokenId) -> bool:
+        with self._transaction() as conn:
+            return bool(
+                conn.execute(
+                    "UPDATE tokens SET lease_until=? WHERE id=? AND status='executing'",
+                    (time.time() + self.LEASE_SECONDS, token_id.value),
+                ).rowcount
+            )
+
+    def bind_channel(self, run_id: RunId, source: str, channel_id: str) -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_bindings(run_id, source, channel_id) "
+                "VALUES (?, ?, ?)",
+                (run_id.value, source, channel_id),
+            )
+            row = conn.execute(
+                "SELECT r.status, d.payload FROM runs r JOIN definitions d "
+                "ON r.definition_hash=d.hash WHERE r.id=?",
+                (run_id.value,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown run")
+            if row["status"] in ("success", "failure"):
+                self._queue_notification(
+                    conn,
+                    run_id.value,
+                    f"실행 완료: {run_id.value} ({row['status']})",
+                    f"end:{run_id.value}",
+                )
+            waiting = conn.execute(
+                "SELECT id, state_id, version FROM tokens "
+                "WHERE run_id=? AND status='waiting_input'",
+                (run_id.value,),
+            ).fetchall()
+            if waiting:
+                definition = definition_from_json(str(row["payload"]))
+                for token in waiting:
+                    prompt = definition.state(str(token["state_id"])).prompt
+                    self._queue_notification(
+                        conn,
+                        run_id.value,
+                        f"응답 필요: {prompt}\n토큰: {token['id']}",
+                        f"wait:{token['id']}:{token['version']}",
+                    )
+
+    def pending_notifications(self) -> tuple[NotificationDTO, ...]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT id, source, channel_id, text FROM notifications "
+                "WHERE status='pending' ORDER BY rowid LIMIT 100"
+            ).fetchall()
+        return tuple(
+            NotificationDTO(
+                id=str(row["id"]),
+                source=str(row["source"]),
+                channel_id=str(row["channel_id"]),
+                text=str(row["text"]),
+            )
+            for row in rows
+        )
+
+    def mark_notification_sent(self, notification_id: str) -> bool:
+        with self._transaction() as conn:
+            return bool(
+                conn.execute(
+                    "UPDATE notifications SET status='sent' WHERE id=? AND status='pending'",
+                    (notification_id,),
+                ).rowcount
+            )
 
     def register_timer(
         self, definition_hash: str, index: int, timer: TimerTrigger, due_at: float

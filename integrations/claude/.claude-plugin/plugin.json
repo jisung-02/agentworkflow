@@ -1,0 +1,6 @@
+{
+  "name": "workflow-host",
+  "version": "0.1.0",
+  "author": {"name": "jisung-02"},
+  "description": "Handle queued local state-transition workflow tasks from Claude Code"
+}

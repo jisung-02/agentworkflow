@@ -3,6 +3,7 @@ from pathlib import Path
 from workflow_engine.application.engine import WorkflowEngine
 from workflow_engine.application.timer import TimerService
 from workflow_engine.infrastructure.cron_schedule import CronNextFire
+from workflow_engine.infrastructure.file_artifacts import FileArtifactStore
 from workflow_engine.infrastructure.runners.echo import EchoRunner
 from workflow_engine.infrastructure.sqlite_store import SQLiteStore
 from workflow_engine.infrastructure.yaml_definition import parse_definition
@@ -53,6 +54,12 @@ states:
     run_ids = timer.fire_due()
     assert len(run_ids) == 1
     assert timer.fire_due() == ()
-    engine = WorkflowEngine(store, {"echo": EchoRunner()}, tmp_path)
+    engine = WorkflowEngine(
+        store,
+        {"echo": EchoRunner()},
+        tmp_path,
+        clock,
+        FileArtifactStore(tmp_path / "artifacts"),
+    )
     assert engine.run_until_idle(run_ids[0]).status == "success"
     assert dict(engine.status(run_ids[0]).outputs)["result"].endswith("request=daily")

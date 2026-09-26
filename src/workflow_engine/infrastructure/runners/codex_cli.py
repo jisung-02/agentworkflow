@@ -54,11 +54,11 @@ class CodexCliRunner:
         self.timeout_seconds = timeout_seconds
 
     def run(self, request: TaskRequestDTO) -> TaskResultDTO:
-        if request.branch_id is not None:
-            raise RuntimeError("Codex code tasks in parallel branches require isolated worktrees")
         workdir = Path(request.workdir).resolve()
         if not workdir.is_dir():
             raise ValueError(f"workdir does not exist: {workdir}")
+        if request.branch_id is not None:
+            workdir = self._worktree_for(request, workdir)
         schema = {
             "type": "object",
             "properties": {
@@ -79,20 +79,34 @@ class CodexCliRunner:
             schema_path = Path(directory) / "schema.json"
             output_path = Path(directory) / "last.json"
             schema_path.write_text(json.dumps(schema), encoding="utf-8")
-            command = [
-                self.executable,
-                "exec",
-                "--json",
-                "--sandbox",
-                "workspace-write",
-                "--cd",
-                str(workdir),
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-                "-",
-            ]
+            if request.external_id is None:
+                command = [
+                    self.executable,
+                    "exec",
+                    "--json",
+                    "--sandbox",
+                    "workspace-write",
+                    "--cd",
+                    str(workdir),
+                    "--output-schema",
+                    str(schema_path),
+                    "--output-last-message",
+                    str(output_path),
+                    "-",
+                ]
+            else:
+                command = [
+                    self.executable,
+                    "exec",
+                    "resume",
+                    "--json",
+                    "--output-schema",
+                    str(schema_path),
+                    "--output-last-message",
+                    str(output_path),
+                    request.external_id,
+                    "-",
+                ]
             completed = self.process(
                 command,
                 input=prompt,
@@ -100,11 +114,15 @@ class CodexCliRunner:
                 capture_output=True,
                 timeout=self.timeout_seconds,
                 check=False,
+                cwd=str(workdir),
             )
+            thread_id = _thread_id(completed.stdout) or request.external_id
             if completed.returncode != 0:
                 reset = _quota_reset(completed.stderr + "\n" + completed.stdout)
                 if reset is not None:
-                    raise QuotaExceeded(reset)
+                    if thread_id is None:
+                        raise RuntimeError("Codex quota reached without a resumable session id")
+                    raise QuotaExceeded(reset, thread_id)
                 raise RuntimeError(
                     f"codex exec exited {completed.returncode}: {completed.stderr[-500:]}"
                 )
@@ -117,6 +135,44 @@ class CodexCliRunner:
             output = data.get("output")
             if not isinstance(output, str):
                 raise ValueError("codex result.output must be a string")
-            return TaskResultDTO(
-                outcome=outcome, output=output, external_id=_thread_id(completed.stdout)
+            if request.branch_id is not None:
+                output += f"\n\nWorkflow worktree: {workdir}"
+            return TaskResultDTO(outcome=outcome, output=output, external_id=thread_id)
+
+    @staticmethod
+    def _worktree_for(request: TaskRequestDTO, workdir: Path) -> Path:
+        branch = request.branch_id
+        if branch is None or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", branch):
+            raise ValueError("branch id is invalid for a worktree path")
+        root_result = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if root_result.returncode != 0:
+            raise RuntimeError("parallel Codex tasks require a Git repository")
+        root = Path(root_result.stdout.strip()).resolve()
+        target = root.parent / f".{root.name}-workflow-worktrees" / request.run_id.value / branch
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            created = subprocess.run(
+                ["git", "-C", str(root), "worktree", "add", "--detach", str(target), "HEAD"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
             )
+            if created.returncode != 0:
+                raise RuntimeError(f"could not create worktree: {created.stderr[-500:]}")
+        actual = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if actual.returncode != 0 or Path(actual.stdout.strip()).resolve() != target.resolve():
+            raise RuntimeError("parallel worktree path is not a Git worktree")
+        return target

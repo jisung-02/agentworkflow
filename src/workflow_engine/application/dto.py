@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
-from workflow_engine.domain.value_objects import RunId, TokenId
+from workflow_engine.domain.value_objects import ArtifactRef, RunId, TokenId
 
 RunStatus = Literal[
     "running",
@@ -32,6 +32,7 @@ class TaskRequestDTO:
     workdir: str
     branch_id: str | None = None
     outcomes: tuple[str, ...] = ()
+    external_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,7 @@ class RunStatusDTO:
     status: RunStatus
     active_states: tuple[str, ...]
     outputs: tuple[tuple[str, str], ...]
+    artifacts: tuple[tuple[str, ArtifactRef], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +62,7 @@ class TokenDTO:
     branch_id: str | None
     last_outcome: str | None
     version: int
+    external_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,3 +73,25 @@ class ScheduleDTO:
     timezone: str
     inputs: tuple[tuple[str, str], ...]
     due_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelCommandDTO:
+    source: str
+    actor_id: str
+    message_id: str
+    text: str
+    channel_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelResponseDTO:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationDTO:
+    id: str
+    source: str
+    channel_id: str
+    text: str
