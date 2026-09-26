@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workflow-engine-local"
+version = "0.1.0"
+description = "Typed local state-transition workflow engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0,<7"]
+
+[project.scripts]
+workflow = "workflow_engine.presentation.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.13", "ty>=0.0.1a20"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/workflow_engine"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ANN", "RUF"]
+ignore = ["ANN002", "ANN003", "ANN204"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/workflow_engine/infrastructure/unsafe_boundary.py" = ["ANN401"]
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

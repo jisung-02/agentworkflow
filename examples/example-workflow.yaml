@@ -1,0 +1,53 @@
+version: 1
+id: example-workflow
+name: 병렬 작업 예제
+entry: plan
+inputs:
+  request:
+    type: string
+    required: true
+triggers:
+  - type: manual
+states:
+  plan:
+    kind: task
+    runner: echo
+    instructions: instructions/plan.md
+    output: plan
+    outcomes: [completed]
+    on:
+      completed: parallel
+  parallel:
+    kind: fork
+    branches:
+      implementation: implement
+      documentation: document
+    join: gather
+  implement:
+    kind: task
+    runner: echo
+    instructions: instructions/implement.md
+    output: implementation
+    outcomes: [completed]
+    on:
+      completed: gather
+  document:
+    kind: task
+    runner: echo
+    instructions: instructions/document.md
+    output: documentation
+    outcomes: [completed]
+    on:
+      completed: gather
+  gather:
+    kind: join
+    policy: all_success
+    on:
+      completed: done
+      failed: failed
+  done:
+    kind: end
+    result: success
+  failed:
+    kind: end
+    result: failure
