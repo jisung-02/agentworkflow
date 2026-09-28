@@ -13,7 +13,7 @@ from workflow_engine.application.dto import (
 )
 from workflow_engine.application.ports import ArtifactStore, Clock, Runner, WorkflowStore
 from workflow_engine.domain.errors import VisitLimitError
-from workflow_engine.domain.model import Definition
+from workflow_engine.domain.model import Definition, State
 from workflow_engine.domain.value_objects import RunId, TokenId
 
 
@@ -83,6 +83,12 @@ class WorkflowEngine:
                     raise ValueError("wait state has no prompt")
                 return self.store.wait_for_input(token, state.prompt)
             if state.kind == "task":
+                pending = self.store.pending_task_result(token.id)
+                if pending is not None:
+                    claimed = self.store.claim(token)
+                    if claimed is None:
+                        return False
+                    return self._finish_task(claimed, state, definition, pending)
                 if state.runner in ("claude-host", "codex-host"):
                     return self.store.wait_for_host(token)
                 claimed = self.store.claim(token)
@@ -112,19 +118,9 @@ class WorkflowEngine:
                         claimed, "runner_error", f"undeclared outcome: {result.outcome}"
                     )
                     raise ValueError(f"runner returned undeclared outcome: {result.outcome}")
-                target = state.destination(result.outcome)
-                artifact = (
-                    self.artifacts.put_text(result.output) if state.output is not None else None
-                )
-                return self.store.move(
-                    claimed,
-                    result.outcome,
-                    target,
-                    definition.state(target).max_visits,
-                    state.output,
-                    result.output,
-                    artifact,
-                )
+                if not self.store.stage_task_result(claimed, result):
+                    return False
+                return self._finish_task(claimed, state, definition, result)
             raise ValueError(f"unknown state kind: {state.kind}")
         except VisitLimitError as exc:
             self.store.mark_attention(self.store.token(token.id), "visit_limit", str(exc))
@@ -179,20 +175,37 @@ class WorkflowEngine:
         state = definition.state(token.state_id)
         if state.runner not in ("claude-host", "codex-host") or outcome not in state.outcomes:
             raise ValueError("host result does not match the waiting task")
-        target = state.destination(outcome)
         try:
-            return self.store.move(
-                token,
-                outcome,
-                target,
-                definition.state(target).max_visits,
-                state.output,
-                output,
-                self.artifacts.put_text(output) if state.output is not None else None,
-            )
+            result = TaskResultDTO(outcome, output)
+            if not self.store.stage_task_result(token, result):
+                return False
+            return self._finish_task(token, state, definition, result)
         except VisitLimitError as exc:
             self.store.mark_attention(self.store.token(token.id), "visit_limit", str(exc))
             return True
+
+    def _finish_task(
+        self, token: TokenDTO, state: State, definition: Definition, result: TaskResultDTO
+    ) -> bool:
+        target = state.destination(result.outcome)
+        try:
+            artifact = self.artifacts.put_text(result.output) if state.output is not None else None
+        except Exception as exc:
+            self.store.mark_attention(token, "artifact_error", str(exc))
+            raise
+        try:
+            return self.store.move(
+                token,
+                result.outcome,
+                target,
+                definition.state(target).max_visits,
+                state.output,
+                result.output,
+                artifact,
+            )
+        except Exception as exc:
+            self.store.mark_attention(token, "result_error", str(exc))
+            raise
 
     def _task_request(
         self, token: TokenDTO, instructions: str, outcomes: tuple[str, ...]
@@ -203,7 +216,7 @@ class WorkflowEngine:
             state_id=token.state_id,
             instructions=instructions,
             inputs=self.store.inputs_for_run(token.run_id),
-            outputs=self.store.outputs_for_run(token.run_id),
+            outputs=self.store.outputs_for_token(token),
             workdir=str(self.workdir),
             branch_id=token.branch_id,
             outcomes=outcomes,

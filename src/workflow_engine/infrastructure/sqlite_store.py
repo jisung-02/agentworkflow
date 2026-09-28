@@ -14,6 +14,7 @@ from workflow_engine.application.dto import (
     RunStatus,
     RunStatusDTO,
     ScheduleDTO,
+    TaskResultDTO,
     TokenDTO,
 )
 from workflow_engine.domain.errors import VisitLimitError
@@ -51,7 +52,16 @@ class SQLiteStore:
                 CREATE TABLE IF NOT EXISTS forks (
                     id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
                     join_state TEXT NOT NULL, expected INTEGER NOT NULL,
-                    completed INTEGER NOT NULL DEFAULT 0
+                    completed INTEGER NOT NULL DEFAULT 0, base_outputs TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE IF NOT EXISTS branch_outputs (
+                    fork_id TEXT NOT NULL REFERENCES forks(id), branch_id TEXT NOT NULL,
+                    output_name TEXT NOT NULL, output TEXT NOT NULL,
+                    PRIMARY KEY (fork_id, branch_id, output_name)
+                );
+                CREATE TABLE IF NOT EXISTS pending_task_results (
+                    token_id TEXT PRIMARY KEY REFERENCES tokens(id),
+                    outcome TEXT NOT NULL, output TEXT NOT NULL, external_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS join_arrivals (
                     fork_id TEXT NOT NULL REFERENCES forks(id), branch_id TEXT NOT NULL,
@@ -110,6 +120,9 @@ class SQLiteStore:
                 conn.execute("ALTER TABLE tokens ADD COLUMN attention_reason TEXT")
             if "attention_detail" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN attention_detail TEXT")
+            fork_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(forks)")}
+            if "base_outputs" not in fork_columns:
+                conn.execute("ALTER TABLE forks ADD COLUMN base_outputs TEXT NOT NULL DEFAULT '{}'")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -259,6 +272,62 @@ class SQLiteStore:
 
     def outputs_for_run(self, run_id: RunId) -> tuple[tuple[str, str], ...]:
         return self._run_pairs(run_id, "outputs")
+
+    def outputs_for_token(self, token: TokenDTO) -> tuple[tuple[str, str], ...]:
+        if token.fork_id is None or token.branch_id is None:
+            return self.outputs_for_run(token.run_id)
+        with closing(self._connect()) as conn:
+            fork = conn.execute(
+                "SELECT base_outputs FROM forks WHERE id=? AND run_id=?",
+                (token.fork_id, token.run_id.value),
+            ).fetchone()
+            if fork is None:
+                raise ValueError("token fork is unknown")
+            outputs = dict(self._pairs(str(fork["base_outputs"])))
+            rows = conn.execute(
+                "SELECT output_name, output FROM branch_outputs WHERE fork_id=? AND branch_id=?",
+                (token.fork_id, token.branch_id),
+            ).fetchall()
+            outputs.update((str(row["output_name"]), str(row["output"])) for row in rows)
+            return tuple(outputs.items())
+
+    def pending_task_result(self, token_id: TokenId) -> TaskResultDTO | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT outcome, output, external_id FROM pending_task_results WHERE token_id=?",
+                (token_id.value,),
+            ).fetchone()
+        if row is None:
+            return None
+        return TaskResultDTO(
+            str(row["outcome"]),
+            str(row["output"]),
+            str(row["external_id"]) if row["external_id"] is not None else None,
+        )
+
+    def stage_task_result(self, token: TokenDTO, result: TaskResultDTO) -> bool:
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT status, version FROM tokens WHERE id=?", (token.id.value,)
+            ).fetchone()
+            if row is None or row["status"] != "executing" or row["version"] != token.version:
+                return False
+            existing = conn.execute(
+                "SELECT outcome, output, external_id FROM pending_task_results WHERE token_id=?",
+                (token.id.value,),
+            ).fetchone()
+            if existing is not None:
+                return (
+                    existing["outcome"] == result.outcome
+                    and existing["output"] == result.output
+                    and existing["external_id"] == result.external_id
+                )
+            conn.execute(
+                "INSERT INTO pending_task_results(token_id, outcome, output, external_id) "
+                "VALUES (?, ?, ?, ?)",
+                (token.id.value, result.outcome, result.output, result.external_id),
+            )
+            return True
 
     def _run_pairs(self, run_id: RunId, column: str) -> tuple[tuple[str, str], ...]:
         with closing(self._connect()) as conn:
@@ -442,6 +511,13 @@ class SQLiteStore:
                     "UPDATE runs SET outputs=? WHERE id=?",
                     (json.dumps(outputs, ensure_ascii=False), token.run_id.value),
                 )
+                if token.fork_id is not None and token.branch_id is not None:
+                    conn.execute(
+                        "INSERT INTO branch_outputs(fork_id, branch_id, output_name, output) "
+                        "VALUES (?, ?, ?, ?) ON CONFLICT(fork_id, branch_id, output_name) "
+                        "DO UPDATE SET output=excluded.output",
+                        (token.fork_id, token.branch_id, output_name, output),
+                    )
                 if artifact is not None:
                     conn.execute(
                         "INSERT INTO artifacts(run_id, output_name, digest, path) "
@@ -449,6 +525,7 @@ class SQLiteStore:
                         "digest=excluded.digest, path=excluded.path",
                         (token.run_id.value, output_name, artifact.digest, artifact.path),
                     )
+            conn.execute("DELETE FROM pending_task_results WHERE token_id=?", (token.id.value,))
             self._event(
                 conn, token.run_id.value, token.id.value, "transition", f"{outcome}:{target}"
             )
@@ -470,9 +547,13 @@ class SQLiteStore:
             if not changed:
                 return False
             fork_id = uuid.uuid4().hex
+            run = conn.execute(
+                "SELECT outputs FROM runs WHERE id=?", (token.run_id.value,)
+            ).fetchone()
             conn.execute(
-                "INSERT INTO forks(id, run_id, join_state, expected) VALUES (?, ?, ?, ?)",
-                (fork_id, token.run_id.value, join, len(branches)),
+                "INSERT INTO forks(id, run_id, join_state, expected, base_outputs) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (fork_id, token.run_id.value, join, len(branches), str(run["outputs"])),
             )
             limit_map = dict(limits)
             for branch_id, target in branches:
@@ -688,7 +769,8 @@ class SQLiteStore:
         with self._transaction() as conn:
             rows = conn.execute(
                 "SELECT id, state_id FROM tokens WHERE run_id=? AND status='needs_attention' "
-                "AND attention_reason IN ('runner_error', 'interrupted')",
+                "AND attention_reason IN ('runner_error', 'interrupted', "
+                "'artifact_error', 'result_error')",
                 (run_id.value,),
             ).fetchall()
             for row in rows:
