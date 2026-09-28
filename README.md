@@ -11,11 +11,11 @@ uv run workflow graph examples/example-workflow.yaml
 uv run workflow run examples/example-workflow.yaml --input request="새 기능 만들기"
 ```
 
-`workflow run`은 JSON으로 실행 ID와 결과를 출력합니다. 기본 DB는 현재 디렉터리의 `.workflow/state.db`이며 `--db`로 바꿀 수 있습니다. `status RUN_ID`, `resume RUN_ID`로 조회·재개합니다. `status`의 `attention`은 중단된 상태와 오류 사유를 보여줍니다. `resume`은 runner 오류나 중단된 실행을 명시적으로 재시도하며, 방문 횟수 상한 초과는 재시도하지 않습니다. 사람의 응답을 기다리는 State는 `status`의 `waiting_tokens`에 토큰 ID가 표시되며 `respond TOKEN_ID OUTCOME`으로 제출합니다. Task 결과는 DB의 `outputs`와 DB 옆 `artifacts/`의 파일에 저장되며, `status`의 `artifacts`에서 경로와 SHA-256을 확인할 수 있습니다.
+`workflow run`은 JSON으로 실행 ID와 결과를 출력합니다. 기본 DB는 현재 디렉터리의 `.workflow/state.db`이며 `--db`로 바꿀 수 있습니다. `status RUN_ID`, `resume RUN_ID`로 조회·재개합니다. `status`의 `attention`은 중단된 상태와 오류 사유를 보여줍니다. `resume`은 runner 오류나 중단된 실행을 명시적으로 재시도하며, 방문 횟수 상한 초과는 재시도하지 않습니다. runner 결과가 SQLite에 보관된 뒤 artifact 저장에 실패했다면, `resume`은 runner를 다시 호출하지 않고 저장과 전이를 마무리합니다. 사람의 응답을 기다리는 State는 `status`의 `waiting_tokens`에 토큰 ID가 표시되며 `respond TOKEN_ID OUTCOME`으로 제출합니다. Task 결과는 DB의 `outputs`와 DB 옆 `artifacts/`의 파일에 저장되며, `status`의 `artifacts`에서 경로와 SHA-256을 확인할 수 있습니다.
 
 타이머가 있는 YAML은 `workflow register FILE`로 등록합니다. `workflow tick`은 기한이 된 스케줄을 한 번 실행하고, `workflow serve --interval 30`은 계속 폴링합니다. 해당 프로세스가 실행 중이어야 예약과 사용량 제한 후 재개가 진행됩니다. 워커는 만료된 실행 lease를 `needs_attention`으로 회수하고, 개별 실행 오류가 나도 다른 준비된 실행을 계속 처리합니다.
 
-`echo` runner는 설치 확인과 테스트용입니다. `codex` runner는 로컬 Codex CLI 로그인 상태를 이용해 `codex exec`를 호출합니다. `codex-review`는 같은 CLI를 읽기 전용 sandbox에서 실행하는 검토용 runner입니다. 처음 사용하기 전에 `codex login`을 완료해야 합니다. 병렬 Codex branch는 원본 Git 저장소의 `HEAD`에서 각각 별도 worktree를 만들며, 원본의 미커밋 변경은 복사되지 않습니다. branch 결과에는 worktree 경로가 포함됩니다. join 뒤 변경 병합은 YAML에서 명시한 후속 작업이 수행해야 합니다.
+`echo` runner는 설치 확인과 테스트용입니다. `codex` runner는 로컬 Codex CLI 로그인 상태를 이용해 `codex exec`를 호출합니다. `codex-review`는 같은 CLI를 읽기 전용 sandbox에서 실행하는 검토용 runner입니다. `codex-qa`는 쓰기 가능한 sandbox에서 테스트를 실행하고, 실행 전후 Git 작업 트리의 추적 파일과 무시되지 않은 새 파일을 비교합니다. QA 중 변경이 생기면 `blocked`를 반환합니다. 처음 사용하기 전에 `codex login`을 완료해야 합니다. 병렬 Codex branch는 원본 Git 저장소의 `HEAD`에서 각각 별도 worktree를 만들며, 원본의 미커밋 변경은 복사되지 않습니다. branch 결과에는 worktree 경로가 포함됩니다. join 뒤 변경 병합은 YAML에서 명시한 후속 작업이 수행해야 합니다.
 
 Codex 사용량 제한이 발생하면 재설정 시각과 세션 ID를 저장하고 `workflow serve`가 재설정 후 같은 세션을 재개합니다. CLI가 세션 ID를 반환하지 않아 안전하게 재개할 수 없는 경우 Run은 `needs_attention`으로 남습니다. 실제 모델 호출은 자동 테스트에 포함되지 않습니다.
 
@@ -51,7 +51,7 @@ GitHub에서 CLI를 설치하려면 `uv tool install git+https://github.com/jisu
 
 ## 사용자 정의 runner
 
-별도 Python 패키지의 entry point 그룹 `workflow_engine.runners`에 `이름 = "패키지:팩토리"`를 등록합니다. 팩토리는 인자 없이 호출되며 `run(TaskRequestDTO) -> TaskResultDTO`를 구현한 객체를 반환해야 합니다. YAML의 `runner`에 해당 이름을 적습니다. 설치된 runner는 Composition Root에서 찾아 `Runner` 인터페이스에 주입하며, `echo`, `codex`, `codex-review`, `claude-host`, `codex-host`는 예약된 이름입니다. 외부 패키지 로딩 중 생기는 동적 타입은 `unsafe_boundary.py`에서 검증합니다.
+별도 Python 패키지의 entry point 그룹 `workflow_engine.runners`에 `이름 = "패키지:팩토리"`를 등록합니다. 팩토리는 인자 없이 호출되며 `run(TaskRequestDTO) -> TaskResultDTO`를 구현한 객체를 반환해야 합니다. YAML의 `runner`에 해당 이름을 적습니다. 설치된 runner는 Composition Root에서 찾아 `Runner` 인터페이스에 주입하며, `echo`, `codex`, `codex-review`, `codex-qa`, `claude-host`, `codex-host`는 예약된 이름입니다. 외부 패키지 로딩 중 생기는 동적 타입은 `unsafe_boundary.py`에서 검증합니다.
 
 개발 환경:
 

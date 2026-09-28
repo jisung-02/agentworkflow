@@ -10,6 +10,7 @@ from workflow_engine.infrastructure.cron_schedule import CronNextFire
 from workflow_engine.infrastructure.file_artifacts import FileArtifactStore
 from workflow_engine.infrastructure.runners.codex_cli import CodexCliRunner
 from workflow_engine.infrastructure.runners.echo import EchoRunner
+from workflow_engine.infrastructure.runners.git_guard import GitGuardRunner
 from workflow_engine.infrastructure.sqlite_store import SQLiteStore
 from workflow_engine.infrastructure.unsafe_boundary import load_runner_plugins
 
@@ -19,6 +20,7 @@ def build_engine(database: Path, workdir: Path) -> WorkflowEngine:
         "echo": EchoRunner(),
         "codex": CodexCliRunner(),
         "codex-review": CodexCliRunner(sandbox_mode="read-only"),
+        "codex-qa": GitGuardRunner(CodexCliRunner()),
     }
     for name, runner in load_runner_plugins().items():
         if name in runners or name in ("claude-host", "codex-host"):
