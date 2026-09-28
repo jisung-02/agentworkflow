@@ -46,7 +46,7 @@ class SQLiteStore:
                     state_id TEXT NOT NULL, status TEXT NOT NULL, fork_id TEXT,
                     branch_id TEXT, last_outcome TEXT, wake_at REAL,
                     claimed_at REAL, lease_until REAL, version INTEGER NOT NULL DEFAULT 0,
-                    external_id TEXT
+                    external_id TEXT, attention_reason TEXT, attention_detail TEXT
                 );
                 CREATE TABLE IF NOT EXISTS forks (
                     id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
@@ -106,6 +106,10 @@ class SQLiteStore:
                 conn.execute("ALTER TABLE tokens ADD COLUMN external_id TEXT")
             if "lease_until" not in columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN lease_until REAL")
+            if "attention_reason" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN attention_reason TEXT")
+            if "attention_detail" not in columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN attention_detail TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -282,6 +286,11 @@ class SQLiteStore:
                 "WHERE run_id=? ORDER BY output_name",
                 (run_id.value,),
             ).fetchall()
+            attention = conn.execute(
+                "SELECT state_id, attention_reason, attention_detail FROM tokens "
+                "WHERE run_id=? AND status='needs_attention' ORDER BY rowid",
+                (run_id.value,),
+            ).fetchall()
         if row is None:
             raise ValueError(f"unknown run {run_id.value}")
         statuses = {str(token["status"]) for token in tokens}
@@ -307,6 +316,14 @@ class SQLiteStore:
             artifacts=tuple(
                 (str(item["output_name"]), ArtifactRef(str(item["digest"]), str(item["path"])))
                 for item in artifacts
+            ),
+            attention=tuple(
+                (
+                    str(item["state_id"]),
+                    f"{item['attention_reason'] or 'unknown'}: "
+                    f"{item['attention_detail'] or ''}".strip(),
+                )
+                for item in attention
             ),
         )
 
@@ -387,13 +404,27 @@ class SQLiteStore:
             changed = conn.execute(
                 "UPDATE tokens SET state_id=?, status='ready', last_outcome=?, claimed_at=NULL, "
                 "lease_until=NULL, "
-                "external_id=NULL, "
+                "external_id=NULL, attention_reason=NULL, attention_detail=NULL, "
                 "version=version+1 WHERE id=? AND state_id=? AND status=? AND version=?",
                 (target, outcome, token.id.value, token.state_id, token.status, token.version),
             ).rowcount
             if not changed:
                 return False
-            self._visit(conn, token.run_id.value, target, max_visits)
+            try:
+                self._visit(conn, token.run_id.value, target, max_visits)
+            except VisitLimitError as exc:
+                conn.execute(
+                    "UPDATE tokens SET state_id=?, status='needs_attention', "
+                    "attention_reason='visit_limit', attention_detail=? WHERE id=?",
+                    (token.state_id, str(exc), token.id.value),
+                )
+                self._event(conn, token.run_id.value, token.id.value, "needs_attention", str(exc))
+                self._queue_notification(
+                    conn,
+                    token.run_id.value,
+                    f"실행 점검 필요: {token.run_id.value} ({exc})",
+                    f"attention:{token.id.value}:{token.version + 1}",
+                )
             if token.status == "executing":
                 conn.execute(
                     "UPDATE attempts SET status='completed', ended_at=? "
@@ -630,16 +661,21 @@ class SQLiteStore:
                 ).rowcount
             )
 
-    def mark_attention(self, token: TokenDTO) -> None:
+    def mark_attention(self, token: TokenDTO, reason: str = "unknown", detail: str = "") -> None:
         with self._transaction() as conn:
             changed = conn.execute(
-                "UPDATE tokens SET status='needs_attention', lease_until=NULL, version=version+1 "
+                "UPDATE tokens SET status='needs_attention', lease_until=NULL, "
+                "attention_reason=?, attention_detail=?, version=version+1 "
                 "WHERE id=? AND status NOT IN ('done', 'joined', 'needs_attention') AND version=?",
-                (token.id.value, token.version),
+                (reason, detail[:4000], token.id.value, token.version),
             ).rowcount
             if changed:
                 self._event(
-                    conn, token.run_id.value, token.id.value, "needs_attention", token.state_id
+                    conn,
+                    token.run_id.value,
+                    token.id.value,
+                    "needs_attention",
+                    f"{reason}: {detail[:4000]}",
                 )
                 self._queue_notification(
                     conn,
@@ -647,6 +683,23 @@ class SQLiteStore:
                     f"실행 점검 필요: {token.run_id.value} (상태: {token.state_id})",
                     f"attention:{token.id.value}:{token.version + 1}",
                 )
+
+    def retry_attention(self, run_id: RunId) -> int:
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT id, state_id FROM tokens WHERE run_id=? AND status='needs_attention' "
+                "AND attention_reason IN ('runner_error', 'interrupted')",
+                (run_id.value,),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE tokens SET status='ready', attention_reason=NULL, "
+                    "attention_detail=NULL, "
+                    "claimed_at=NULL, lease_until=NULL, version=version+1 WHERE id=?",
+                    (row["id"],),
+                )
+                self._event(conn, run_id.value, str(row["id"]), "retry", str(row["state_id"]))
+            return len(rows)
 
     def _recover_expired(
         self, conn: sqlite3.Connection, now: float, run_id: RunId | None = None
@@ -662,7 +715,9 @@ class SQLiteStore:
         rows = conn.execute(query, parameters).fetchall()
         for row in rows:
             conn.execute(
-                "UPDATE tokens SET status='needs_attention', lease_until=NULL, version=version+1 "
+                "UPDATE tokens SET status='needs_attention', lease_until=NULL, "
+                "attention_reason='interrupted', attention_detail='execution lease expired', "
+                "version=version+1 "
                 "WHERE id=?",
                 (row["id"],),
             )

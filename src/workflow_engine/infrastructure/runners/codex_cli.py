@@ -44,6 +44,27 @@ def _thread_id(events: str) -> str | None:
     return None
 
 
+def _failure_detail(stdout: str, stderr: str) -> str:
+    errors: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = _mapping(load_json(line), "codex event")
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if event.get("type") in ("error", "turn.failed"):
+            error = event.get("error", event.get("message"))
+            if isinstance(error, dict):
+                error = error.get("message")
+            if isinstance(error, str):
+                errors.append(error)
+    details = " | ".join(errors[-3:])
+    stderr = stderr.strip()
+    if stderr:
+        excerpt = stderr if len(stderr) <= 3000 else f"{stderr[:1500]}\n…\n{stderr[-1500:]}"
+        details += f"\nstderr: {excerpt}"
+    return details[:4000] or "no error details reported"
+
+
 class CodexCliRunner:
     def __init__(
         self,
@@ -128,7 +149,8 @@ class CodexCliRunner:
                         raise RuntimeError("Codex quota reached without a resumable session id")
                     raise QuotaExceeded(reset, thread_id)
                 raise RuntimeError(
-                    f"codex exec exited {completed.returncode}: {completed.stderr[-500:]}"
+                    f"codex exec exited {completed.returncode}: "
+                    f"{_failure_detail(completed.stdout, completed.stderr)}"
                 )
             if not output_path.is_file():
                 raise RuntimeError("codex exec produced no final message")

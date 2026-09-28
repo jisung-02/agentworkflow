@@ -66,10 +66,14 @@ class ChannelController:
                     for name, value in status.outputs
                 )
                 summary = outputs[:2500] + ("…" if len(outputs) > 2500 else "")
+                reasons = "; ".join(
+                    f"{state}: {reason[:400]}" for state, reason in status.attention
+                )
                 return ChannelResponseDTO(
                     f"{run_id.value}: {status.status}; 현재 상태: "
                     f"{', '.join(status.active_states) or '없음'}; 응답 대기: {pending or '없음'}; "
-                    f"결과 요약: {summary or '없음'}"
+                    f"결과 요약: {summary or '없음'}; 점검 사유: "
+                    f"{reasons or '없음'}"
                 )
             if action == "respond" and len(parts) == 3:
                 token_id = TokenId(parts[1])

@@ -11,7 +11,7 @@ uv run workflow graph examples/example-workflow.yaml
 uv run workflow run examples/example-workflow.yaml --input request="새 기능 만들기"
 ```
 
-`workflow run`은 JSON으로 실행 ID와 결과를 출력합니다. 기본 DB는 현재 디렉터리의 `.workflow/state.db`이며 `--db`로 바꿀 수 있습니다. `status RUN_ID`, `resume RUN_ID`로 조회·재개합니다. 사람의 응답을 기다리는 State는 `status`의 `waiting_tokens`에 토큰 ID가 표시되며 `respond TOKEN_ID OUTCOME`으로 제출합니다. Task 결과는 DB의 `outputs`와 DB 옆 `artifacts/`의 파일에 저장되며, `status`의 `artifacts`에서 경로와 SHA-256을 확인할 수 있습니다.
+`workflow run`은 JSON으로 실행 ID와 결과를 출력합니다. 기본 DB는 현재 디렉터리의 `.workflow/state.db`이며 `--db`로 바꿀 수 있습니다. `status RUN_ID`, `resume RUN_ID`로 조회·재개합니다. `status`의 `attention`은 중단된 상태와 오류 사유를 보여줍니다. `resume`은 runner 오류나 중단된 실행을 명시적으로 재시도하며, 방문 횟수 상한 초과는 재시도하지 않습니다. 사람의 응답을 기다리는 State는 `status`의 `waiting_tokens`에 토큰 ID가 표시되며 `respond TOKEN_ID OUTCOME`으로 제출합니다. Task 결과는 DB의 `outputs`와 DB 옆 `artifacts/`의 파일에 저장되며, `status`의 `artifacts`에서 경로와 SHA-256을 확인할 수 있습니다.
 
 타이머가 있는 YAML은 `workflow register FILE`로 등록합니다. `workflow tick`은 기한이 된 스케줄을 한 번 실행하고, `workflow serve --interval 30`은 계속 폴링합니다. 해당 프로세스가 실행 중이어야 예약과 사용량 제한 후 재개가 진행됩니다. 워커는 만료된 실행 lease를 `needs_attention`으로 회수하고, 개별 실행 오류가 나도 다른 준비된 실행을 계속 처리합니다.
 

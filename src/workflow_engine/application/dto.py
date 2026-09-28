@@ -50,6 +50,7 @@ class RunStatusDTO:
     active_states: tuple[str, ...]
     outputs: tuple[tuple[str, str], ...]
     artifacts: tuple[tuple[str, ArtifactRef], ...] = ()
+    attention: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

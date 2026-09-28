@@ -91,6 +91,7 @@ def _print_status(engine: WorkflowEngine, run_id: RunId) -> None:
                 "status": status.status,
                 "active_states": status.active_states,
                 "outputs": dict(status.outputs),
+                "attention": dict(status.attention),
                 "artifacts": {
                     name: {"digest": artifact.digest, "path": artifact.path}
                     for name, artifact in status.artifacts

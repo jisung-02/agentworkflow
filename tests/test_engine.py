@@ -1,6 +1,8 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from workflow_engine.application.dto import StartRunCommand, TaskRequestDTO, TaskResultDTO
 from workflow_engine.application.engine import QuotaExceeded, WorkflowEngine
 from workflow_engine.infrastructure.clock import SystemClock
@@ -29,7 +31,29 @@ class QuotaOnceRunner:
         return TaskResultDTO(outcome="completed", output=request.state_id)
 
 
-def _engine(tmp_path: Path, runner: EchoRunner | QuotaOnceRunner) -> WorkflowEngine:
+class FailOnceRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, request: TaskRequestDTO) -> TaskResultDTO:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("specific runner failure")
+        return TaskResultDTO(outcome="completed", output="recovered")
+
+
+class ReviewRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, request: TaskRequestDTO) -> TaskResultDTO:
+        self.calls += 1
+        return TaskResultDTO(outcome="completed", output=f"review round {self.calls}")
+
+
+def _engine(
+    tmp_path: Path, runner: EchoRunner | QuotaOnceRunner | FailOnceRunner | ReviewRunner
+) -> WorkflowEngine:
     return WorkflowEngine(
         SQLiteStore(tmp_path / "run.db"),
         {"echo": runner},
@@ -151,3 +175,49 @@ states:
     token_id = engine.store.waiting_tokens(run_id)[0].id
     assert engine.submit_input(token_id, "again")
     assert engine.status(run_id).status == "needs_attention"
+
+
+def test_task_result_survives_visit_limit(tmp_path: Path) -> None:
+    source = tmp_path / "task-loop.yaml"
+    (tmp_path / "task.md").write_text("Do work", encoding="utf-8")
+    source.write_text(
+        """version: 1
+id: task-loop
+entry: task
+inputs:
+  request: {type: string, required: true}
+states:
+  task:
+    kind: task
+    runner: echo
+    instructions: task.md
+    output: review
+    max_visits: 2
+    outcomes: [completed]
+    on: {completed: task}
+""",
+        encoding="utf-8",
+    )
+    definition = parse_definition(source)
+    engine = _engine(tmp_path, ReviewRunner())
+    run_id = engine.start(definition, StartRunCommand(definition.id, (("request", "build"),)))
+    assert engine.run_until_idle(run_id).status == "needs_attention"
+    status = engine.status(run_id)
+    assert dict(status.outputs)["review"] == "review round 2"
+    assert Path(dict(status.artifacts)["review"].path).read_text() == "review round 2"
+    assert "max_visits=2" in dict(status.attention)["task"]
+    assert engine.resume(run_id).status == "needs_attention"
+
+
+def test_resume_retries_runner_error_and_keeps_diagnostic(tmp_path: Path) -> None:
+    definition = parse_definition(EXAMPLE)
+    runner = FailOnceRunner()
+    engine = _engine(tmp_path, runner)
+    run_id = engine.start(definition, StartRunCommand(definition.id, (("request", "build"),)))
+    with pytest.raises(RuntimeError, match="specific runner failure"):
+        engine.run_until_idle(run_id)
+    status = engine.status(run_id)
+    assert status.status == "needs_attention"
+    assert "specific runner failure" in dict(status.attention)["plan"]
+    assert engine.resume(run_id).status == "success"
+    assert runner.calls == 4

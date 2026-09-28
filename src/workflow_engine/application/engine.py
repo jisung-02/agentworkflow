@@ -89,22 +89,28 @@ class WorkflowEngine:
                 if claimed is None:
                     return False
                 if state.runner is None or state.instructions is None:
-                    self.store.mark_attention(claimed)
+                    self.store.mark_attention(
+                        claimed, "configuration", "runner or instructions missing"
+                    )
                     return True
                 runner = self.runners.get(state.runner)
                 if runner is None:
-                    self.store.mark_attention(claimed)
+                    self.store.mark_attention(
+                        claimed, "configuration", f"unknown runner: {state.runner}"
+                    )
                     return True
                 request = self._task_request(claimed, state.instructions, state.outcomes)
                 try:
                     result = self._run_with_heartbeat(runner, request)
                 except QuotaExceeded as exc:
                     return self.store.quota_wait(claimed, exc.wake_at, exc.external_id)
-                except Exception:
-                    self.store.mark_attention(claimed)
+                except Exception as exc:
+                    self.store.mark_attention(claimed, "runner_error", str(exc))
                     raise
                 if result.outcome not in state.outcomes:
-                    self.store.mark_attention(claimed)
+                    self.store.mark_attention(
+                        claimed, "runner_error", f"undeclared outcome: {result.outcome}"
+                    )
                     raise ValueError(f"runner returned undeclared outcome: {result.outcome}")
                 target = state.destination(result.outcome)
                 artifact = (
@@ -120,8 +126,8 @@ class WorkflowEngine:
                     artifact,
                 )
             raise ValueError(f"unknown state kind: {state.kind}")
-        except VisitLimitError:
-            self.store.mark_attention(self.store.token(token.id))
+        except VisitLimitError as exc:
+            self.store.mark_attention(self.store.token(token.id), "visit_limit", str(exc))
             return True
 
     def run_until_idle(self, run_id: RunId, max_steps: int = 1000) -> RunStatusDTO:
@@ -132,6 +138,7 @@ class WorkflowEngine:
         raise RuntimeError("step budget exceeded")
 
     def resume(self, run_id: RunId) -> RunStatusDTO:
+        self.store.retry_attention(run_id)
         self.store.recover_inflight(run_id)
         return self.run_until_idle(run_id)
 
@@ -148,8 +155,8 @@ class WorkflowEngine:
             return self.store.submit_input(
                 token, outcome, target, definition.state(target).max_visits
             )
-        except VisitLimitError:
-            self.store.mark_attention(self.store.token(token.id))
+        except VisitLimitError as exc:
+            self.store.mark_attention(self.store.token(token.id), "visit_limit", str(exc))
             return True
 
     def host_next(self, runner_id: str) -> TaskRequestDTO | None:
@@ -183,8 +190,8 @@ class WorkflowEngine:
                 output,
                 self.artifacts.put_text(output) if state.output is not None else None,
             )
-        except VisitLimitError:
-            self.store.mark_attention(self.store.token(token.id))
+        except VisitLimitError as exc:
+            self.store.mark_attention(self.store.token(token.id), "visit_limit", str(exc))
             return True
 
     def _task_request(

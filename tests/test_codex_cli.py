@@ -11,9 +11,10 @@ from workflow_engine.infrastructure.runners.codex_cli import CodexCliRunner
 
 
 class FakeProcess:
-    def __init__(self, returncode: int = 0, stderr: str = "") -> None:
+    def __init__(self, returncode: int = 0, stderr: str = "", stdout: str = "") -> None:
         self.returncode = returncode
         self.stderr = stderr
+        self.stdout = stdout
         self.command: list[str] = []
 
     def __call__(
@@ -37,7 +38,7 @@ class FakeProcess:
         return subprocess.CompletedProcess(
             command,
             self.returncode,
-            '{"type":"thread.started","thread_id":"session-1"}\n',
+            '{"type":"thread.started","thread_id":"session-1"}\n' + self.stdout,
             self.stderr,
         )
 
@@ -76,6 +77,16 @@ def test_codex_cli_converts_usage_limit_to_wait(tmp_path: Path) -> None:
         CodexCliRunner(process=fake).run(_request(tmp_path))
     assert error.value.wake_at > 0
     assert error.value.external_id == "session-1"
+
+
+def test_codex_failure_preserves_json_error_ahead_of_stderr_warning(tmp_path: Path) -> None:
+    fake = FakeProcess(
+        returncode=1,
+        stderr="unrelated MCP warning\n" * 100,
+        stdout='{"type":"turn.failed","error":{"message":"actual model failure"}}\n',
+    )
+    with pytest.raises(RuntimeError, match="actual model failure"):
+        CodexCliRunner(process=fake).run(_request(tmp_path))
 
 
 def test_codex_cli_resumes_saved_session(tmp_path: Path) -> None:
