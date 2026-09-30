@@ -37,7 +37,7 @@ uv run --all-extras workflow serve-http --definitions ./definitions
 
 ## Codex·Claude Code 호스트 스킬
 
-`runner: codex-host` 또는 `runner: claude-host`인 State는 해당 호스트가 작업을 가져갈 때까지 `waiting_host`로 남습니다. 타이머로 만든 Run도 동일하게 대기합니다.
+`runner: codex-host` 또는 `runner: claude-host`인 State는 해당 호스트가 작업을 가져갈 때까지 `waiting_host`로 남습니다. Slack·Discord에서 시작한 Run은 호스트 대기 상태를 채널에도 알립니다. 타이머로 만든 Run도 동일하게 대기합니다. 호스트 작업의 임대가 만료되면 변경 사항을 확인한 뒤 `workflow resume RUN_ID`로 다시 대기시킬 수 있습니다.
 
 ```bash
 workflow host-next --runner claude-host

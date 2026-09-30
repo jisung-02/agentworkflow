@@ -648,6 +648,12 @@ class SQLiteStore:
                 self._event(
                     conn, token.run_id.value, token.id.value, "waiting_host", token.state_id
                 )
+                self._queue_notification(
+                    conn,
+                    token.run_id.value,
+                    f"호스트 작업 대기: {token.run_id.value} (상태: {token.state_id})",
+                    f"host:{token.id.value}:{token.version + 1}",
+                )
             return bool(changed)
 
     def host_waiting(self) -> tuple[TokenDTO, ...]:
@@ -879,6 +885,17 @@ class SQLiteStore:
                         f"응답 필요: {prompt}\n토큰: {token['id']}",
                         f"wait:{token['id']}:{token['version']}",
                     )
+            hosting = conn.execute(
+                "SELECT id, state_id, version FROM tokens WHERE run_id=? AND status='waiting_host'",
+                (run_id.value,),
+            ).fetchall()
+            for token in hosting:
+                self._queue_notification(
+                    conn,
+                    run_id.value,
+                    f"호스트 작업 대기: {run_id.value} (상태: {token['state_id']})",
+                    f"host:{token['id']}:{token['version']}",
+                )
 
     def can_access(self, run_id: RunId, source: str, actor_id: str) -> bool:
         with closing(self._connect()) as conn:

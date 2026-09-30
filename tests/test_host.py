@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -33,15 +34,20 @@ states:
         encoding="utf-8",
     )
     definition = parse_definition(path)
+    store = SQLiteStore(tmp_path / "state.db")
     engine = WorkflowEngine(
-        SQLiteStore(tmp_path / "state.db"),
+        store,
         {},
         tmp_path,
         SystemClock(),
         FileArtifactStore(tmp_path / "artifacts"),
     )
     run_id = engine.start(definition, StartRunCommand(definition.id, ()))
+    store.bind_channel(run_id, "slack", "U1", "C1")
     assert engine.run_until_idle(run_id).status == "waiting_host"
+    notices = store.pending_notifications()
+    assert len(notices) == 1
+    assert "호스트 작업 대기" in notices[0].text
     restarted = WorkflowEngine(
         SQLiteStore(tmp_path / "state.db"),
         {},
@@ -101,3 +107,39 @@ states:
         == 0
     )
     assert json.loads(capsys.readouterr().out)["status"] == "success"
+
+
+def test_resume_requeues_expired_host_claim(tmp_path: Path) -> None:
+    instruction = tmp_path / "instructions.md"
+    instruction.write_text("Check it", encoding="utf-8")
+    definition_path = tmp_path / "host.yaml"
+    definition_path.write_text(
+        """version: 1
+id: host-expiry
+entry: task
+states:
+  task:
+    kind: task
+    runner: claude-host
+    instructions: instructions.md
+    output: review
+    outcomes: [approved]
+    on: {approved: done}
+  done: {kind: end, result: success}
+""",
+        encoding="utf-8",
+    )
+    db = tmp_path / "state.db"
+    engine = WorkflowEngine(
+        SQLiteStore(db), {}, tmp_path, SystemClock(), FileArtifactStore(tmp_path / "artifacts")
+    )
+    definition = parse_definition(definition_path)
+    run_id = engine.start(definition, StartRunCommand(definition.id, ()))
+    assert engine.run_until_idle(run_id).status == "waiting_host"
+    task = engine.host_next("claude-host")
+    assert task is not None
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE tokens SET lease_until=0 WHERE id=?", (task.token_id.value,))
+    assert engine.store.recover_expired_inflight(engine.clock.now_epoch()) == 1
+    assert engine.resume(run_id).status == "waiting_host"
+    assert engine.host_next("claude-host") is not None
